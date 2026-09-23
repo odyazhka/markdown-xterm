@@ -1,0 +1,292 @@
+diff --git a/charproc.c b/charproc.c
+index 922895e..6891b8e 100644
+--- a/charproc.c
++++ b/charproc.c
+@@ -118,6 +118,8 @@ typedef int (*BitFunc) (unsigned * /* p */ ,
+ 			unsigned /* mask */ );
+ 
+ static IChar doinput(XtermWidget /* xw */ );
++extern int mdterm_hook_flush_due(XtermWidget, PtyData *);
++extern long mdterm_hook_wait_usec(void);
+ static int set_character_class(char * /*s */ );
+ static void FromAlternate(XtermWidget /* xw */ ,
+ 			  Bool /* clearFirst */ );
+@@ -6836,6 +6838,9 @@ in_put(XtermWidget xw)
+ 	    break;
+ #endif
+ 	}
++	/* mdterm: deliver queued/idle-held output before going to sleep */
++	if (screen->eventMode == NORMAL && mdterm_hook_flush_due(xw, VTbuffer))
++	    break;
+ 	update_the_screen(xw);
+ 
+ 	XFlush(screen->display);	/* always flush writes before waiting */
+@@ -6881,6 +6886,13 @@ in_put(XtermWidget xw)
+ 		ImproveTimeout(50000L);
+ 		time_select = 1;
+ 	    }
++	    {
++		long md_wait = mdterm_hook_wait_usec();
++		if (md_wait >= 0) {
++		    ImproveTimeout(md_wait);
++		    time_select = 1;
++		}
++	    }
+ #if OPT_BLINK_CURS
+ 	    if ((screen->blink_timer != 0 &&
+ 		 ((screen->select & FOCUS) || screen->always_highlight)) ||
+diff --git a/ptydata.c b/ptydata.c
+index 9edc13c..4894813 100644
+--- a/ptydata.c
++++ b/ptydata.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include <data.h>
++#include "mdterm_bridge.h"
+ 
+ #if OPT_WIDE_CHARS
+ #include <menu.h>
+@@ -245,6 +246,232 @@ decodeUtf8(const TScreen *screen, PtyData *data)
+ }
+ #endif
+ 
++/* ------------------------------------------------------------------ */
++/* mdterm: markdown -> ANSI filter between read(pty) and the VT parser */
++/* ------------------------------------------------------------------ */
++
++#define MDTERM_FLUSH_USEC 40000L	/* flush a held partial line after 40ms idle */
++
++static void *md_state = NULL;
++static int md_enabled = -1;		/* -1 = not decided yet */
++static int md_holding = 0;		/* partial line currently held in Rust? */
++static struct timeval md_last_input;
++
++static unsigned char *md_scratch = NULL;	/* copy of the raw bytes just read */
++static size_t md_scratch_cap = 0;
++
++static unsigned char *md_ovf = NULL;	/* converted bytes that did not fit yet */
++static size_t md_ovf_len = 0;
++static size_t md_ovf_cap = 0;
++
++static int
++md_is_enabled(void)
++{
++    if (md_enabled < 0) {
++	const char *env = getenv("MDTERM");
++	md_enabled = !(env != NULL && (*env == '0' || *env == 'n' || *env == 'N'));
++	if (md_enabled)
++	    md_state = mdterm_new();
++    }
++    return md_enabled;
++}
++
++static size_t
++md_room(const PtyData *data)
++{
++    size_t used = (size_t) (data->last - data->buffer);
++    size_t total = (size_t) (BUF_SIZE + FRG_SIZE);
++    return (used < total) ? (total - used) : 0;
++}
++
++static void
++md_ovf_append(const unsigned char *src, size_t n)
++{
++    if (md_ovf_len + n > md_ovf_cap) {
++	size_t want = md_ovf_len + n + 4096;
++	unsigned char *p = (unsigned char *) realloc(md_ovf, want);
++	if (p == NULL)
++	    return;		/* out of memory: drop rather than crash */
++	md_ovf = p;
++	md_ovf_cap = want;
++    }
++    memcpy(md_ovf + md_ovf_len, src, n);
++    md_ovf_len += n;
++}
++
++/*
++ * Append n bytes after the `*off` bytes already staged at data->last.
++ * Whatever does not fit in the fixed-size PtyData buffer goes to the
++ * overflow queue and is delivered later by mdterm_hook_flush_due().
++ * data->last itself is NOT moved here; the caller does that once.
++ */
++static void
++md_emit(PtyData *data, size_t *off, const unsigned char *src, size_t n)
++{
++    if (md_ovf_len == 0) {
++	size_t room = md_room(data);
++	size_t fit;
++	room = (room > *off) ? (room - *off) : 0;
++	fit = (n < room) ? n : room;
++	if (fit) {
++	    memcpy(data->last + *off, src, fit);
++	    *off += fit;
++	    src += fit;
++	    n -= fit;
++	}
++    }
++    if (n)
++	md_ovf_append(src, n);
++}
++
++static void
++md_touch(void)
++{
++    if (md_state != NULL && mdterm_pending_len(md_state) > 0) {
++	md_holding = 1;
++	gettimeofday(&md_last_input, NULL);
++    } else {
++	md_holding = 0;
++    }
++}
++
++static int
++md_has_altscreen_switch(const unsigned char *buf, size_t len)
++{
++    static const char *const seqs[] =
++    {"\033[?1049h", "\033[?1047h", "\033[?47h"};
++    size_t i, k;
++
++    for (i = 0; i < len; ++i) {
++	if (buf[i] != 0x1b)
++	    continue;
++	for (k = 0; k < sizeof(seqs) / sizeof(seqs[0]); ++k) {
++	    size_t n = strlen(seqs[k]);
++	    if (len - i >= n && memcmp(buf + i, seqs[k], n) == 0)
++		return 1;
++	}
++    }
++    return 0;
++}
++
++/*
++ * Called from readPtyData() right after read(): the `size` raw bytes sit at
++ * data->last.  Returns how many bytes should end up there (may be 0 while a
++ * partial line is being held back).
++ */
++static size_t
++md_filter(XtermWidget xw, PtyData *data, size_t size)
++{
++    size_t off = 0;
++    size_t out_len = 0;
++    unsigned char *out;
++    int active;
++
++    if (!md_is_enabled())
++	return size;
++
++    /* full-screen programs (vim, less, htop...) live on the alt screen; the
++     * switch may arrive in this very chunk, before xterm's parser saw it */
++    active = (TScreenOf(xw)->whichBuf == 0)
++	&& !md_has_altscreen_switch(data->last, size);
++
++    if (!active && !md_holding && md_ovf_len == 0)
++	return size;		/* fast path: nothing to do */
++
++    if (size > md_scratch_cap) {
++	unsigned char *p = (unsigned char *) realloc(md_scratch, size);
++	if (p == NULL)
++	    return size;
++	md_scratch = p;
++	md_scratch_cap = size;
++    }
++    memcpy(md_scratch, data->last, size);
++
++    if (!active) {
++	/* leaving markdown mode: release what we held, then raw bytes */
++	out = mdterm_flush(md_state, &out_len);
++	if (out != NULL) {
++	    md_emit(data, &off, out, out_len);
++	    mdterm_free_buf(out, out_len);
++	}
++	md_emit(data, &off, md_scratch, size);
++	md_holding = 0;
++	return off;
++    }
++
++    out = mdterm_feed(md_state, md_scratch, size, &out_len);
++    if (out != NULL) {
++	md_emit(data, &off, out, out_len);
++	mdterm_free_buf(out, out_len);
++    }
++    md_touch();
++    return off;
++}
++
++/*
++ * Called from in_put() on every pass: deliver overflow, or flush a partial
++ * line that has been idle too long (shell prompt, typed characters...).
++ * Returns non-zero if new bytes were appended to `data`.
++ */
++int
++mdterm_hook_flush_due(XtermWidget xw, PtyData *data)
++{
++    size_t off = 0;
++
++    if (md_state == NULL || !md_enabled)
++	return 0;
++
++    trimPtyData(xw, data);
++
++    if (md_ovf_len != 0) {
++	size_t room = md_room(data);
++	size_t n = (md_ovf_len < room) ? md_ovf_len : room;
++	if (n) {
++	    memcpy(data->last, md_ovf, n);
++	    memmove(md_ovf, md_ovf + n, md_ovf_len - n);
++	    md_ovf_len -= n;
++	    off = n;
++	}
++    } else if (md_holding) {
++	struct timeval now;
++	long idle;
++	gettimeofday(&now, NULL);
++	idle = (long) (now.tv_sec - md_last_input.tv_sec) * 1000000L
++	    + (long) (now.tv_usec - md_last_input.tv_usec);
++	if (idle >= MDTERM_FLUSH_USEC) {
++	    size_t out_len = 0;
++	    unsigned char *out = mdterm_flush(md_state, &out_len);
++	    if (out != NULL) {
++		md_emit(data, &off, out, out_len);
++		mdterm_free_buf(out, out_len);
++	    }
++	    md_holding = 0;
++	}
++    }
++    data->last += off;
++    return (off != 0);
++}
++
++/* Microseconds in_put() may sleep in select(), or -1 for "no limit". */
++long
++mdterm_hook_wait_usec(void)
++{
++    if (md_state == NULL || !md_enabled)
++	return -1;
++    if (md_ovf_len != 0)
++	return 1;
++    if (md_holding) {
++	struct timeval now;
++	long idle, left;
++	gettimeofday(&now, NULL);
++	idle = (long) (now.tv_sec - md_last_input.tv_sec) * 1000000L
++	    + (long) (now.tv_usec - md_last_input.tv_usec);
++	left = MDTERM_FLUSH_USEC - idle;
++	return (left > 1) ? left : 1;
++    }
++    return -1;
++}
++
+ int
+ readPtyData(XtermWidget xw, PtySelect * select_mask, PtyData *data)
+ {
+@@ -288,6 +515,9 @@ readPtyData(XtermWidget xw, PtySelect * select_mask, PtyData *data)
+ #endif /* f*ugly */
+     }
+ 
++    if (size > 0)
++	size = (int) md_filter(xw, data, (size_t) size);	/* mdterm hook */
++
+     if (size) {
+ #if OPT_TRACE
+ 	int i;

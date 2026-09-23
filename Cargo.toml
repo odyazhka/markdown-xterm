@@ -1,0 +1,22 @@
+[package]
+name = "mdterm_bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Streaming markdown -> ANSI converter, linked into xterm as a static C library"
+
+[lib]
+name = "mdterm_bridge"
+# staticlib -> produces libmdterm_bridge.a for linking straight into xterm's
+# own build. Switch to "cdylib" instead (or add it alongside) if you'd
+# rather link xterm against a .so.
+crate-type = ["staticlib"]
+
+[dependencies]
+regex = "1"
+
+[profile.release]
+# Never unwind across the C FFI boundary - abort instead. A panic inside
+# mdterm_feed() would otherwise be undefined behaviour once it tries to
+# unwind through xterm's C stack frames.
+panic = "abort"
+lto = true
