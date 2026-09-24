@@ -2,8 +2,8 @@
  * mdterm_bridge.h
  *
  * C-facing API for the Rust markdown -> ANSI streaming converter.
- * Drop this next to ptydata.c (or anywhere on xterm's include path)
- * and #include it from ptydata.c - see xterm-411-mdterm.patch.
+ * Drop this next to ptydata.c (or anywhere on xterm's include path); it is
+ * #included from ptydata.c - see xterm-411-mdterm.patch.
  */
 #ifndef MDTERM_BRIDGE_H
 #define MDTERM_BRIDGE_H
@@ -16,7 +16,7 @@ extern "C" {
 
 /*
  * Create a new converter instance. Holds the "incomplete line so far"
- * buffer plus whether we're currently inside a ``` code fence.
+ * buffer plus the block state (open code fence, buffered table rows, ...).
  * Returns an opaque handle; never returns NULL (aborts the process on
  * allocation failure, same as C's malloc-or-die idiom).
  */
@@ -47,15 +47,31 @@ unsigned char *mdterm_feed(void *state,
                             size_t input_len,
                             size_t *out_len);
 
-/* Number of bytes currently held back (a partial line with no '\n' yet). */
+/* Number of bytes currently held back (partial line, soft-wrapped text,
+ * buffered table rows). */
 size_t mdterm_pending_len(const void *state);
 
 /*
- * Take the held-back partial line back *unconverted* and clear it.
- * The C side calls this when no '\n' has arrived for a short while
- * (shell prompts, echoed keystrokes) or before switching to raw mode.
- * Returns NULL and sets *out_len = 0 if nothing is pending; otherwise
- * release the buffer with mdterm_free_buf().
+ * Tell the converter how many columns the terminal has (0 = unknown). Used to
+ * word-wrap prose and to fit tables. Call before mdterm_feed(); cheap.
+ */
+void mdterm_set_width(void *state, size_t cols);
+
+/*
+ * How long the caller should let the held-back text sit idle before showing
+ * it as it is:
+ *   1 - it looks interactive (shell prompt, echoed keys): a moment (~40 ms)
+ *   2 - a slow LLM-style stream is running: a long time (~60 s), so a pause
+ *       in the middle of a line does not spoil its formatting
+ *   0 - anything else: the normal timeout (~2 s)
+ */
+int mdterm_hold_class(const void *state);
+
+/*
+ * The idle timeout fired (or raw mode is about to start): take back
+ * everything that is being held. Tables are drawn, prose is converted as far
+ * as it goes, prompts come out unchanged. Returns NULL and sets *out_len = 0
+ * if nothing is held; otherwise release the buffer with mdterm_free_buf().
  */
 unsigned char *mdterm_flush(void *state, size_t *out_len);
 
