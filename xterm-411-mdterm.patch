@@ -1,17 +1,27 @@
 diff --git a/charproc.c b/charproc.c
-index 922895e..6891b8e 100644
+index 922895e..2b672bc 100644
 --- a/charproc.c
 +++ b/charproc.c
-@@ -118,6 +118,8 @@ typedef int (*BitFunc) (unsigned * /* p */ ,
+@@ -118,6 +118,9 @@ typedef int (*BitFunc) (unsigned * /* p */ ,
  			unsigned /* mask */ );
  
  static IChar doinput(XtermWidget /* xw */ );
 +extern int mdterm_hook_flush_due(XtermWidget, PtyData *);
 +extern long mdterm_hook_wait_usec(void);
++extern void mdterm_hook_note_input(void);
  static int set_character_class(char * /*s */ );
  static void FromAlternate(XtermWidget /* xw */ ,
  			  Bool /* clearFirst */ );
-@@ -6836,6 +6838,9 @@ in_put(XtermWidget xw)
+@@ -6539,6 +6542,8 @@ static Char *v_bufend;		/* end of physical buffer */
+ void
+ v_write(int f, const Char *data, size_t len)
+ {
++    if (len > 0)
++	mdterm_hook_note_input();	/* mdterm: user typed / reply sent */
+     TRACE2(("v_write(%d:%s)\n", len, visibleChars(data, len)));
+     if (v_bufstr == NULL) {
+ 	if (len > 0) {
+@@ -6836,6 +6841,9 @@ in_put(XtermWidget xw)
  	    break;
  #endif
  	}
@@ -21,7 +31,7 @@ index 922895e..6891b8e 100644
  	update_the_screen(xw);
  
  	XFlush(screen->display);	/* always flush writes before waiting */
-@@ -6881,6 +6886,13 @@ in_put(XtermWidget xw)
+@@ -6881,6 +6889,13 @@ in_put(XtermWidget xw)
  		ImproveTimeout(50000L);
  		time_select = 1;
  	    }
@@ -36,18 +46,19 @@ index 922895e..6891b8e 100644
  	    if ((screen->blink_timer != 0 &&
  		 ((screen->select & FOCUS) || screen->always_highlight)) ||
 diff --git a/ptydata.c b/ptydata.c
-index 9edc13c..4894813 100644
+index 9edc13c..8c801a1 100644
 --- a/ptydata.c
 +++ b/ptydata.c
-@@ -31,6 +31,7 @@
+@@ -31,6 +31,8 @@
   */
  
  #include <data.h>
 +#include "mdterm_bridge.h"
++#define MDTERM_PATCH_VERSION 3	/* checked by build.sh */
  
  #if OPT_WIDE_CHARS
  #include <menu.h>
-@@ -245,6 +246,232 @@ decodeUtf8(const TScreen *screen, PtyData *data)
+@@ -245,6 +247,314 @@ decodeUtf8(const TScreen *screen, PtyData *data)
  }
  #endif
  
@@ -55,12 +66,18 @@ index 9edc13c..4894813 100644
 +/* mdterm: markdown -> ANSI filter between read(pty) and the VT parser */
 +/* ------------------------------------------------------------------ */
 +
-+#define MDTERM_FLUSH_USEC 40000L	/* flush a held partial line after 40ms idle */
++#define MDTERM_SHORT_USEC 40000L	/* prompts / echoed keys: flush after 40ms idle */
++#define MDTERM_KEY_USEC   300000L	/* "a key was just pressed" window */
++#define MDTERM_HOLD_DEFAULT_MS 2000L	/* ordinary partial line: flush after 2s idle */
++#define MDTERM_STREAM_DEFAULT_MS 60000L	/* slow LLM-style stream running: wait up to 60s */
 +
 +static void *md_state = NULL;
 +static int md_enabled = -1;		/* -1 = not decided yet */
 +static int md_holding = 0;		/* partial line currently held in Rust? */
-+static struct timeval md_last_input;
++static struct timeval md_last_input;	/* last time a partial line was held */
++static struct timeval md_last_key;	/* last time the user wrote to the pty */
++static long md_hold_usec = MDTERM_HOLD_DEFAULT_MS * 1000L;
++static long md_stream_usec = MDTERM_STREAM_DEFAULT_MS * 1000L;
 +
 +static unsigned char *md_scratch = NULL;	/* copy of the raw bytes just read */
 +static size_t md_scratch_cap = 0;
@@ -75,8 +92,15 @@ index 9edc13c..4894813 100644
 +    if (md_enabled < 0) {
 +	const char *env = getenv("MDTERM");
 +	md_enabled = !(env != NULL && (*env == '0' || *env == 'n' || *env == 'N'));
-+	if (md_enabled)
++	if (md_enabled) {
++	    const char *ms = getenv("MDTERM_HOLD_MS");
 +	    md_state = mdterm_new();
++	    if (ms != NULL && atol(ms) > 0)
++		md_hold_usec = atol(ms) * 1000L;
++	    ms = getenv("MDTERM_STREAM_MS");
++	    if (ms != NULL && atol(ms) > 0)
++		md_stream_usec = atol(ms) * 1000L;
++	}
 +    }
 +    return md_enabled;
 +}
@@ -87,6 +111,41 @@ index 9edc13c..4894813 100644
 +    size_t used = (size_t) (data->last - data->buffer);
 +    size_t total = (size_t) (BUF_SIZE + FRG_SIZE);
 +    return (used < total) ? (total - used) : 0;
++}
++
++/* MDTERM_DEBUG=/path/file : log every chunk read from the pty and what we
++ * hand to xterm instead (control bytes shown as \\xNN), to diagnose programs. */
++static FILE *md_dbg = NULL;
++static int md_dbg_tried = 0;
++
++static void
++md_log(const char *tag, const unsigned char *p, size_t n)
++{
++    size_t i;
++    if (!md_dbg_tried) {
++	const char *path = getenv("MDTERM_DEBUG");
++	md_dbg_tried = 1;
++	if (path != NULL && *path != '\0')
++	    md_dbg = fopen(path, "a");
++    }
++    if (md_dbg == NULL)
++	return;
++    fprintf(md_dbg, "%s ", tag);
++    for (i = 0; i < n; ++i) {
++	unsigned char c = p[i];
++	if (c == '\n')
++	    fputs("\\n\n     ", md_dbg);
++	else if (c == '\r')
++	    fputs("\\r", md_dbg);
++	else if (c == '\\')
++	    fputs("\\\\", md_dbg);
++	else if ((c >= 0x20 && c < 0x7f) || c >= 0x80)
++	    fputc(c, md_dbg);
++	else
++	    fprintf(md_dbg, "\\x%02x", c);
++    }
++    fputc('\n', md_dbg);
++    fflush(md_dbg);
 +}
 +
 +static void
@@ -127,6 +186,38 @@ index 9edc13c..4894813 100644
 +    }
 +    if (n)
 +	md_ovf_append(src, n);
++}
++
++/* Called from v_write(): the user (or a query reply) just wrote to the pty. */
++void
++mdterm_hook_note_input(void)
++{
++    gettimeofday(&md_last_key, NULL);
++}
++
++static long
++md_usec_since(const struct timeval *then, const struct timeval *now)
++{
++    return (long) (now->tv_sec - then->tv_sec) * 1000000L
++	+ (long) (now->tv_usec - then->tv_usec);
++}
++
++/*
++ * How long a held partial line may sit idle before it is shown as-is.
++ * Short for anything that looks like a prompt / typed echo, long for prose
++ * so that slow token streams (LLMs) are still converted a whole line at a time.
++ */
++static long
++md_limit_usec(const struct timeval *now)
++{
++    int cls = mdterm_hold_class(md_state);	/* 1 prompt/echo, 2 slow stream, 0 other */
++    if (cls == 1)
++	return MDTERM_SHORT_USEC;
++    if (md_last_key.tv_sec != 0 && md_usec_since(&md_last_key, now) < MDTERM_KEY_USEC)
++	return MDTERM_SHORT_USEC;
++    if (cls == 2)
++	return md_stream_usec;
++    return md_hold_usec;
 +}
 +
 +static void
@@ -191,6 +282,7 @@ index 9edc13c..4894813 100644
 +	md_scratch_cap = size;
 +    }
 +    memcpy(md_scratch, data->last, size);
++    md_log("IN ", md_scratch, size);
 +
 +    if (!active) {
 +	/* leaving markdown mode: release what we held, then raw bytes */
@@ -204,8 +296,10 @@ index 9edc13c..4894813 100644
 +	return off;
 +    }
 +
++    mdterm_set_width(md_state, (size_t) (TScreenOf(xw)->max_col + 1));
 +    out = mdterm_feed(md_state, md_scratch, size, &out_len);
 +    if (out != NULL) {
++	md_log("OUT", out, out_len);
 +	md_emit(data, &off, out, out_len);
 +	mdterm_free_buf(out, out_len);
 +    }
@@ -241,12 +335,12 @@ index 9edc13c..4894813 100644
 +	struct timeval now;
 +	long idle;
 +	gettimeofday(&now, NULL);
-+	idle = (long) (now.tv_sec - md_last_input.tv_sec) * 1000000L
-+	    + (long) (now.tv_usec - md_last_input.tv_usec);
-+	if (idle >= MDTERM_FLUSH_USEC) {
++	idle = md_usec_since(&md_last_input, &now);
++	if (idle >= md_limit_usec(&now)) {
 +	    size_t out_len = 0;
 +	    unsigned char *out = mdterm_flush(md_state, &out_len);
 +	    if (out != NULL) {
++		md_log("FLUSH(idle, shown raw)", out, out_len);
 +		md_emit(data, &off, out, out_len);
 +		mdterm_free_buf(out, out_len);
 +	    }
@@ -269,9 +363,8 @@ index 9edc13c..4894813 100644
 +	struct timeval now;
 +	long idle, left;
 +	gettimeofday(&now, NULL);
-+	idle = (long) (now.tv_sec - md_last_input.tv_sec) * 1000000L
-+	    + (long) (now.tv_usec - md_last_input.tv_usec);
-+	left = MDTERM_FLUSH_USEC - idle;
++	idle = md_usec_since(&md_last_input, &now);
++	left = md_limit_usec(&now) - idle;
 +	return (left > 1) ? left : 1;
 +    }
 +    return -1;
@@ -280,7 +373,7 @@ index 9edc13c..4894813 100644
  int
  readPtyData(XtermWidget xw, PtySelect * select_mask, PtyData *data)
  {
-@@ -288,6 +515,9 @@ readPtyData(XtermWidget xw, PtySelect * select_mask, PtyData *data)
+@@ -288,6 +598,9 @@ readPtyData(XtermWidget xw, PtySelect * select_mask, PtyData *data)
  #endif /* f*ugly */
      }
  
