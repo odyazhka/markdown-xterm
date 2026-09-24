@@ -43,7 +43,7 @@ sh
 Дальше одинаково:
 ```
 git clone https://github.com/odyazhka/markdown-xterm.git
-cd mdterm-bridge
+cd markdown-xterm
 ./build.sh
 ```
 Скрипт соберёт Rust-библиотеку, скачает исходники xterm 411, наложит патч и соберёт xterm. Готовый бинарник: build/xterm-411/xterm.
@@ -51,41 +51,6 @@ cd mdterm-bridge
 build/xterm-411/xterm                                  # обычный запуск
 build/xterm-411/xterm -e sh examples/demo.sh           # показать все возможности
 MDTERM=0 build/xterm-411/xterm                         # конвертер выключен
-
-    Не клади проект в путь с пробелами: configure не любит их в LIBS.
-
-Ручная сборка (если хочешь по шагам)
-
-# 1. Rust-библиотека -> target/release/libmdterm_bridge.a
-cargo build --release
-
-# 2. исходники xterm 411 (нужна именно эта версия)
-curl -L https://github.com/ThomasDickey/xterm-snapshots/archive/refs/tags/xterm-411.tar.gz | tar xz
-mv xterm-snapshots-xterm-411 xterm-411
-cd xterm-411
-
-# 3. заголовок + патч
-cp ../mdterm_bridge.h .
-patch -p1 < ../xterm-411-mdterm.patch
-
-# 4. сборка с линковкой библиотеки
-LIBS="-L$(realpath ../target/release) -lmdterm_bridge -lpthread -ldl -lm" ./configure
-make -j4
-./xterm
-
-Патч накладывается один раз на чистые исходники. Если поменялся сам патч, удали xterm-411 и начни с шага 2 (./build.sh делает это сам).
-Изменил src/lib.rs, как пересобрать
-
-make не замечает, что поменялась .a-библиотека, поэтому бинарник нужно удалить, иначе получишь старую версию:
-sh
-
-cargo build --release
-cd build/xterm-411
-rm -f xterm
-make
-
-Или просто запусти ./build.sh ещё раз.
-Поменять цвета
 
 Цвета заголовков: функция heading_style в src/lib.rs, цвета кода, ссылок и т. п.: константы в начале файла. Это обычные ANSI SGR-коды (\x1b[1;35m = жирный розовый, \x1b[96m = яркий голубой).
 Как это устроено
