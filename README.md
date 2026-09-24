@@ -31,23 +31,22 @@ Markdown	Как выглядит
 sh
 
 # Void
-sudo xbps-install -S base-devel rust cargo curl patch libXaw-devel libXt-devel libXft-devel libXmu-devel libXpm-devel libXext-devel libX11-devel ncurses-devel
+```sudo xbps-install -S base-devel rust cargo curl patch libXaw-devel libXt-devel libXft-devel libXmu-devel libXpm-devel libXext-devel libX11-devel ncurses-devel```
 # Debian / Ubuntu
-sudo apt install build-essential cargo curl patch libxaw7-dev libxt-dev libxft-dev libxmu-dev libxpm-dev libxext-dev libx11-dev libncurses-dev
+```sudo apt install build-essential cargo curl patch libxaw7-dev libxt-dev libxft-dev libxmu-dev libxpm-dev libxext-dev libx11-dev libncurses-dev```
 # Fedora
-sudo dnf install gcc make cargo curl patch libXaw-devel libXt-devel libXft-devel libXmu-devel libXpm-devel libXext-devel libX11-devel ncurses-devel
+```sudo dnf install gcc make cargo curl patch libXaw-devel libXt-devel libXft-devel libXmu-devel libXpm-devel libXext-devel libX11-devel ncurses-devel```
 # Arch
-sudo pacman -S --needed base-devel rust curl patch libxaw libxt libxft libxmu libxpm libxext libx11 ncurses
+```sudo pacman -S --needed base-devel rust curl patch libxaw libxt libxft libxmu libxpm libxext libx11 ncurses```
 
-Дальше одна команда:
-sh
 
-git clone https://github.com/<твой-ник>/mdterm-bridge.git
+Дальше одинаково:
+```
+git clone https://github.com/odyazhka/markdown-xterm.git
 cd mdterm-bridge
 ./build.sh
-
+```
 Скрипт соберёт Rust-библиотеку, скачает исходники xterm 411, наложит патч и соберёт xterm. Готовый бинарник: build/xterm-411/xterm.
-sh
 
 build/xterm-411/xterm                                  # обычный запуск
 build/xterm-411/xterm -e sh examples/demo.sh           # показать все возможности
@@ -56,7 +55,6 @@ MDTERM=0 build/xterm-411/xterm                         # конвертер вы
     Не клади проект в путь с пробелами: configure не любит их в LIBS.
 
 Ручная сборка (если хочешь по шагам)
-sh
 
 # 1. Rust-библиотека -> target/release/libmdterm_bridge.a
 cargo build --release
