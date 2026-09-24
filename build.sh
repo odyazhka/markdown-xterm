@@ -13,6 +13,11 @@ echo "==> [1/4] Building the Rust library"
 
 echo "==> [2/4] Fetching xterm-411"
 mkdir -p "$WORK"
+# a tree patched by an older version of this project must not be reused
+if [ -d "$WORK/xterm-411" ] && ! grep -q "MDTERM_PATCH_VERSION 3" "$WORK/xterm-411/ptydata.c" 2>/dev/null; then
+    echo "    (found an older patched tree, starting over)"
+    rm -rf "$WORK/xterm-411"
+fi
 if [ ! -d "$WORK/xterm-411" ]; then
     curl -fsSL "$URL" | tar -xz -C "$WORK"
     mv "$WORK/xterm-snapshots-xterm-411" "$WORK/xterm-411"
@@ -21,7 +26,7 @@ cd "$WORK/xterm-411"
 
 echo "==> [3/4] Applying the patch"
 cp "$HERE/mdterm_bridge.h" .
-if grep -q mdterm_hook_flush_due ptydata.c 2>/dev/null; then
+if grep -q "MDTERM_PATCH_VERSION 3" ptydata.c 2>/dev/null; then
     echo "    (already patched, skipping)"
 else
     patch -p1 < "$HERE/xterm-411-mdterm.patch"
