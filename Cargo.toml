@@ -13,10 +13,11 @@ crate-type = ["staticlib"]
 
 [dependencies]
 regex = "1"
+unicode-width = "0.1"
 
 [profile.release]
 # Never unwind across the C FFI boundary - abort instead. A panic inside
 # mdterm_feed() would otherwise be undefined behaviour once it tries to
-# unwind through xterm's C stack frames.
+# unwind through in_put()'s C stack frames.
 panic = "abort"
 lto = true
