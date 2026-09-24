@@ -4,7 +4,7 @@
 
 <img width="835" height="810" alt="изображение" src="https://github.com/user-attachments/assets/bcfe1a99-6153-4b81-a640-12046e334ea7" />
 
-[![Скачать xterm](https://img.shields.io/badge/%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C-xterm-blue?style=for-the-badge&logo=github)](https://github.com/odyazhka/markdown-xterm/xterm)
+[![Скачать xterm](https://img.shields.io/badge/%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C-xterm-blue?style=for-the-badge&logo=github)](https://github.com/odyazhka/markdown-xterm/blob/main/xterm)
 
 ниже описание от клода
 
