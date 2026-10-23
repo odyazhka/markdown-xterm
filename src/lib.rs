@@ -769,10 +769,15 @@ impl MdTermState {
     /// 2 = a slow LLM-style stream is running: wait a long time for the rest.
     /// 0 = anything else.
     fn hold_class(&self) -> i32 {
-        if !self.pending.is_empty()
-            && (has_unsafe_control(&self.pending) || looks_like_prompt(&self.pending))
-        {
-            return 1;
+        if !self.pending.is_empty() {
+            // Leading noise (bare '\r' from a spinner clean-up, CSI/OSC
+            // sequences) is not content: judge the text after it, otherwise
+            // a streamed reply whose first line follows a spinner is shown raw.
+            let text = String::from_utf8_lossy(&self.pending);
+            let body = &text[control_prefix_len(&text)..];
+            if has_unsafe_control(body.as_bytes()) || looks_like_prompt(body.as_bytes()) {
+                return 1;
+            }
         }
         if self.in_slow_session() {
             return 2;
@@ -1278,6 +1283,20 @@ fn process_physical(st: &mut MdTermState, line: &str, out: &mut String) {
 /// Feed new bytes into `state`, returning converted output for every
 /// complete line now available, or `None` if we're still waiting on a
 /// terminating '\n'.
+/// Remove the part of an open line that a later erase has overwritten.
+fn drop_overwritten(pending: &mut Vec<u8>) {
+    fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).rposition(|w| w == needle)
+    }
+    let end = [&b"\x1b[2K"[..], &b"\x1b[1G\x1b[K"[..]]
+        .iter()
+        .filter_map(|pat| rfind(pending, pat).map(|i| i + pat.len()))
+        .max();
+    if let Some(end) = end {
+        pending.drain(..end);
+    }
+}
+
 fn feed_bytes(state: &mut MdTermState, input: &[u8]) -> Option<Vec<u8>> {
     state.pending.extend_from_slice(input);
 
@@ -1285,13 +1304,18 @@ fn feed_bytes(state: &mut MdTermState, input: &[u8]) -> Option<Vec<u8>> {
     let mut produced = false;
 
     while let Some(pos) = state.pending.iter().position(|&b| b == b'\n') {
-        let line_bytes: Vec<u8> = state.pending.drain(..=pos).collect();
+        let mut line_bytes: Vec<u8> = state.pending.drain(..=pos).collect();
+        drop_overwritten(&mut line_bytes);
         // Lossy is deliberate: a genuinely malformed byte shouldn't wedge
         // the whole terminal, it just renders as U+FFFD like everywhere else.
         let line = String::from_utf8_lossy(&line_bytes);
         process_physical(state, &line, &mut out);
         produced = true;
     }
+
+    // Spinner frames are erased in place (`ESC[2K`, or `ESC[1G ESC[K`). What
+    // is in front of such an erase on the still-open line is already gone.
+    drop_overwritten(&mut state.pending);
 
     if state.pending.len() > MAX_PENDING {
         state.release_held_raw("\r\n", &mut out);
@@ -1799,6 +1823,26 @@ mod tests {
         assert!(has_unsafe_control(b"abc\x1b[K"));
         assert!(has_unsafe_control(b"abc\r"));
         assert!(has_unsafe_control(b"abc\x08"));
+    }
+
+    #[test]
+    fn spinner_noise_before_prose_is_not_interactive() {
+        let mut st = MdTermState::new();
+        feed_bytes(&mut st, b"\r\x1b[K**\xd1\x82\xd0\xb5\xd1\x81\xd1\x82**");
+        assert_eq!(st.hold_class(), 0);
+    }
+
+    #[test]
+    fn spinner_frames_before_answer_are_dropped() {
+        let mut st = MdTermState::new();
+        let out = feed_bytes(
+            &mut st,
+            "\x1b[?2026h\x1b[?25l\x1b[1G\u{280b} \x1b[K\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[?25l\x1b[2K\x1b[1G\x1b[?25h\x1b[?25l**тест** строка\n".as_bytes(),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(BOLD_ON), "answer line must be converted: {text:?}");
+        assert!(!strip_sgr(&text).contains("**"));
     }
 
     #[test]
